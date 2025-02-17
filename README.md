@@ -1,5 +1,9 @@
 # gun-vue-sqlite-ionic-storage-adapter
 
+
+
+
+
 这是一个gunjs的储存适配器。
 为使用VUE制作的移动设备针对性设计。增强vue中的gun网络储存持久化的能力。
 目前来看它是一个可靠的方案，因为已经通过了各项严格的压力测试并应用于真实项目中。
@@ -8,16 +12,16 @@
 
 vue模版的前期准备：
 
-安装gun
+# 安装 gun
 yarn add gun
 
-安装gun-flint
+# 安装 gun-flint
 yarn add gun-flint
 
-安装@ionic/storage
+# 安装 @ionic/storage
 yarn add @ionic/storage
 
-安装sqlite驱动
+# 安装 sqlite 驱动
 yarn add localforage-cordovasqlitedriver
 
 关于gun-vue可插拔组件请访问
@@ -81,11 +85,12 @@ storage.remove 会自动生成 DELETE FROM users WHERE id = ;
         对于储存来看，硬盘会像发生海啸一样。但它的实时同步延迟是最低的。
 
 关于分页您可以使用分块储存与读取，例如：
-.get('chunks')
-    .get(String(latestChunk))
-    .get(momentId)
-    .put(momentData
-
+```bash
+  .get('chunks')
+  .get(String(latestChunk))
+  .get(momentId)
+  .put(momentData);
+```
 
 接下来我们来讨论关于应用层储存方案，这个方案主要目的是为了尽可能的阻断旧消息涌入
 这里实际上是双储存，也就是使用2个本地持久化的数据库，或者是你也可以使用sqlite+indexedDB
@@ -96,6 +101,10 @@ gun默认情况下会优先使用indexedDB，我们只使用gun同步数据而�
 这里你需要根据你自己的需求来编写gun与sqlite的同步逻辑与清除机制
 例如在发送数据的接口中新增一个内置的保存到sqlite中的方法，或者是直接在适配器中改写你的自动选择性同步的
         因为这个方案过于简单但却又有比较多的代码量，所以本人不手写了，如果您有类似的需求可以尝试我的建议。
-  
+
+  最后非常感谢开源贡献者们提供的帮助，一个人无法完成全部的工作，我们共同的付出会带来更美好的世界。
+
+
+
 
  
