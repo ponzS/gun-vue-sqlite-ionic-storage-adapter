@@ -4,7 +4,7 @@ import { Flint, NodeAdapter } from 'gun-flint';
 
 async function ensureStorage() {
   if (!sharedStorage) {
-    // sharedStorage 在模块加载时应该已经初始化，但这里做个保险
+    // sharedStorage 在模块加载时已经初始化，但这里做个保险
     await sharedStorage.create();
   }
   return sharedStorage;
