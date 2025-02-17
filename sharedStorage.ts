@@ -2,7 +2,7 @@
 import { Storage, Drivers } from '@ionic/storage';
 import CordovaSQLiteDriver from 'localforage-cordovasqlitedriver'
 export const sharedStorage = new Storage({
-    name: 'talkflowuser.db',
+    name: 'test.db',
     driverOrder: [CordovaSQLiteDriver._driver, Drivers.IndexedDB],
   }) as any;
   
