@@ -1,287 +1,305 @@
 /* 
   自定义适配器，使用 Gun-Flint + Ionic/Capacitor 的 SQLite (sharedStorage) 进行持久化。
-  本次更新的关键点：在 put() 中对旧节点和新节点做 CRDT 合并，防止字段被覆盖丢失。
-  如果遇到问题可以在x中联系我。
-  注意：此适配器已实现核心思路，如需额外定制化需要更完善的错误处理、日志、特殊数据类型处理等。
+  本次升级关键点：
+  - 性能优化：批量操作、缓存热点数据、减少 JSON 开销。
+  - 处理GUN带来的数据海啸：请求队列、防抖机制。
+  - CRDT 合并：支持嵌套对象。
+  - SQLite 持久性：运行时缓存与 SQLite 深度整合，启动时恢复。
+  - 如需帮助，可在 X 上联系我。
 */
 
-import { sharedStorage } from './sharedStorage'
-import { Flint, NodeAdapter } from 'gun-flint'
+import { sharedStorage } from './sharedStorage';
+import { Flint, NodeAdapter } from 'gun-flint';
+
+// 简单日志工具
+const log = {
+  debug: (msg: string, ...args: any[]) => console.debug(`[Gun-Vue-Sqlite] ${msg}`, ...args),
+  info: (msg: string, ...args: any[]) => console.info(`[Gun-Vue-Sqlite] ${msg}`, ...args),
+  warn: (msg: string, ...args: any[]) => console.warn(`[Gun-Vue-Sqlite] ${msg}`, ...args),
+  error: (msg: string, ...args: any[]) => console.error(`[Gun-Vue-Sqlite] ${msg}`, ...args),
+};
 
 /** 
- * 确保 sharedStorage 已经完成初始化。
- * 可在适配器初始化时多次尝试 create()，避免因延迟导致的报错。
+ * 确保 sharedStorage 初始化，支持重试。
  */
-async function ensureStorage() {
-  if (!sharedStorage) {
-    await sharedStorage.create()
+async function ensureStorage(maxRetries = 3, retryDelay = 500): Promise<any> {
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      if (!sharedStorage) await sharedStorage.create();
+      return sharedStorage;
+    } catch (err: any) {
+      log.warn(`Storage init attempt ${i + 1} failed:`, err);
+      if (i === maxRetries - 1) throw new Error(`Failed to init storage after ${maxRetries} retries: ${err.message}`);
+      await new Promise(resolve => setTimeout(resolve, retryDelay));
+    }
   }
-  return sharedStorage
 }
 
 /** 
- * 1) CRDT 合并函数
- * - 读取旧节点 oldNode，和新节点 newNode
- * - 根据 Gun 的逻辑：对每个字段比较 state (_.>[field])，取较新的值
- * - 避免覆盖丢失老字段
+ * CRDT 合并函数（支持嵌套对象）
  */
-function mergeCRDT(oldNode: any, newNode: any) {
-  // 如果旧节点不存在，则直接返回新节点
-  if (!oldNode) {
-    return newNode
-  }
-  if (!oldNode._ || !oldNode._['>']) {
-    // 旧节点不含任何metadata，直接用新节点
-    return newNode
-  }
-  if (!newNode._ || !newNode._['>']) {
-    // 新节点没有metadata，可能是异常？
-    // 视需求可直接返回 oldNode，或将其简单覆盖
-    return oldNode
-  }
+function mergeCRDT(oldNode: any, newNode: any): any {
+  if (!oldNode) return { ...newNode };
+  if (!newNode) return { ...oldNode };
 
-  const merged = JSON.parse(JSON.stringify(oldNode)) // 拷贝旧节点
-  const oldState = merged._['>']
-  const newState = newNode._['>']
+  const oldMeta = oldNode._ && oldNode._['>'] ? oldNode._['>'] : {};
+  const newMeta = newNode._ && newNode._['>'] ? newNode._['>'] : {};
+  const merged = { ...oldNode, _: { ...oldNode._, '>': { ...oldMeta } } };
 
-  // 遍历 newNode 的每个字段
   for (const field in newNode) {
-    if (field === '_') continue // 跳过 metadata
-    const newVal = newNode[field]
-    const newValState = newState[field]
+    if (field === '_') continue;
+    const newVal = newNode[field];
+    const newState = newMeta[field] || Date.now();
 
-    // 如果旧节点没有此字段，则直接用新字段
-    if (merged[field] === undefined) {
-      merged[field] = newVal
-      merged._['>'][field] = newValState
+    if (!(field in oldNode)) {
+      merged[field] = newVal;
+      merged._['>'][field] = newState;
+    } else if (typeof newVal === 'object' && typeof oldNode[field] === 'object' && newVal !== null && oldNode[field] !== null) {
+      merged[field] = mergeCRDT(oldNode[field], newVal);
     } else {
-      // 否则比较 state 值
-      const oldValState = oldState[field] || 0
-      if (newValState > oldValState) {
-        // 新值更新
-        merged[field] = newVal
-        merged._['>'][field] = newValState
+      const oldState = oldMeta[field] || 0;
+      if (newState > oldState) {
+        merged[field] = newVal;
+        merged._['>'][field] = newState;
       }
-      // 如果新值 state 不大于旧值，保持旧值不变
+    }
+  }
+  return merged;
+}
+
+/**
+ * 请求队列和缓存（与 SQLite 深度整合）
+ */
+class RequestQueue {
+  private queue: Map<string, { resolve: (data: any) => void; reject: (err: any) => void }[]> = new Map();
+  private debounceTimers: Map<string, NodeJS.Timeout> = new Map();
+  private cache: Map<string, { data: any; timestamp: number }> = new Map();
+  private storage: any;
+  private cacheTTL = 24 * 60 * 60 * 1000; // 缓存有效期：24小时
+
+  constructor(storage: any) {
+    this.storage = storage;
+    this.initCache();
+  }
+
+  // 初始化时从 SQLite 恢复缓存
+  async initCache() {
+    try {
+      const cachedData = await this.storage.get('persistentCache');
+      if (cachedData) {
+        this.cache = new Map(JSON.parse(cachedData));
+        // 检查缓存有效性
+        const now = Date.now();
+        for (const [key, { timestamp }] of this.cache) {
+          if (now - timestamp > this.cacheTTL) {
+            this.cache.delete(key);
+          }
+        }
+        await this.storage.set('persistentCache', JSON.stringify([...this.cache]));
+      }
+    } catch (err) {
+      log.error('Failed to initialize cache from storage:', err);
     }
   }
 
-  return merged
+  // 获取数据（优先缓存）
+  async get(key: string): Promise<any> {
+    if (this.cache.has(key)) {
+      const { data, timestamp } = this.cache.get(key)!;
+      if (Date.now() - timestamp < this.cacheTTL) {
+        log.debug(`Cache hit for key=${key}`);
+        return data;
+      } else {
+        this.cache.delete(key); // 过期则移除
+      }
+    }
+
+    return new Promise((resolve, reject) => {
+      const handlers = this.queue.get(key) || [];
+      handlers.push({ resolve, reject });
+      this.queue.set(key, handlers);
+
+      if (!this.debounceTimers.has(key)) {
+        const timer = setTimeout(async () => {
+          const handlers = this.queue.get(key) || [];
+          this.queue.delete(key);
+          this.debounceTimers.delete(key);
+
+          try {
+            const dataStr = await this.storage.get(key);
+            const data = dataStr ? JSON.parse(dataStr) : null;
+            this.cache.set(key, { data, timestamp: Date.now() });
+            await this.storage.set('persistentCache', JSON.stringify([...this.cache]));
+            handlers.forEach(h => h.resolve(data));
+          } catch (err) {
+            handlers.forEach(h => h.reject(err));
+          }
+        }, 50);
+        this.debounceTimers.set(key, timer);
+      }
+    });
+  }
+
+  // 写入数据（批量）
+  async put(soul: string, node: any): Promise<void> {
+    const oldData = await this.get(soul);
+    const merged = mergeCRDT(oldData, node);
+    await this.storage.set(soul, JSON.stringify(merged));
+    this.cache.set(soul, { data: merged, timestamp: Date.now() });
+    await this.storage.set('persistentCache', JSON.stringify([...this.cache]));
+  }
+
+  // 批量写入
+  async batchPut(nodes: Record<string, any>): Promise<void> {
+    const updates: [string, string][] = [];
+    for (const soul in nodes) {
+      const oldData = await this.get(soul);
+      const merged = mergeCRDT(oldData, nodes[soul]);
+      updates.push([soul, JSON.stringify(merged)]);
+      this.cache.set(soul, { data: merged, timestamp: Date.now() });
+    }
+    // 批量写入
+    await Promise.all(updates.map(([key, value]) => this.storage.set(key, value)));
+    await this.storage.set('persistentCache', JSON.stringify([...this.cache]));
+  }
+
+  // 清理缓存
+  async clearCache() {
+    this.cache.clear();
+    await this.storage.remove('persistentCache');
+  }
 }
 
-/** 
- * 2) 适配器的核心实现
+/**
+ * 适配器核心实现
  */
 const gunIonicAdapter = new NodeAdapter({
-
-  // ------------------------------------------------------
-  // opt(context, options):
-  //   - 初始化时调用，把 sharedStorage 实例挂载到 this.storage
-  // ------------------------------------------------------
   opt: async function (context: any, options: any) {
-    console.log("Gun-Vue-Sqlite-Adapter: opt() called. context:", context, "options:", options)
-    const storageInstance = await ensureStorage()
-    this.storage = storageInstance
-    return options
+    log.info('Adapter initialized:', { context, options });
+    const storageInstance = await ensureStorage();
+    this.storage = storageInstance;
+    this.queue = new RequestQueue(storageInstance);
+
+    // 预加载热点数据（例如 buddyList）
+    try {
+      const buddyList = await this.queue.get('buddyList');
+      if (buddyList) {
+        log.info('Preloaded buddyList from cache');
+      }
+    } catch (err) {
+      log.warn('Failed to preload buddyList:', err);
+    }
+
+    return options;
   },
 
-  // ------------------------------------------------------
-  // get(key, field, done):
-  //   - 读取数据并返回给 Gun
-  //   - field 可能是回调，也可能是“要读取的字段”
-  //   - 一般情况下可直接返回完整 node 给 Gun，Gun会自行按字段映射
-  // ------------------------------------------------------
   get: async function (key: string, field: any, done: (err: any, data?: any) => void) {
-    console.log("Gun-Vue-Sqlite-Adapter: get() called. key =", key, "field =", field)
+    log.debug(`get called: key=${key}, field=`, field);
 
-    // 兼容 (key, callback) 调用方式
-    if (typeof field === 'function' && done === undefined) {
-      done = field
-      field = null
+    if (typeof field === 'function' && !done) {
+      done = field;
+      field = null;
     }
-    if (typeof done !== 'function') {
-     // console.warn("No callback function in get() call. key=", key)
-      return
-    }
-    if (!key) {
-    //  console.warn("get() with empty key => returning null")
-      return done(null, null)
-    }
+    if (typeof done !== 'function') return;
 
     try {
-      const storageInstance = this.storage || await ensureStorage()
+      if (!key) return done(null, null);
 
-      // ============== 处理自定义命令 ==============
       if (field && field.__command === 'paginate') {
-        // 例如分页读取
-        // field 里可包含 { chatId, offset, limit }
-        const chatId = field.chatId
-        const offset = field.offset || 0
-        const limit = field.limit || 10
+        const chatId = field.chatId;
+        const offset = field.offset || 0;
+        const limit = field.limit || 10;
+        const allKeys = await this.storage.keys();
+        const chatKeys = allKeys.filter((k: string) => k.startsWith(chatId)).sort();
+        const selected = chatKeys.slice(offset, offset + limit);
+        const result: Record<string, any> = {};
 
-        const allKeys = await storageInstance.keys()
-        const chatKeys = allKeys.filter((k: string) => k.startsWith(chatId))
-        chatKeys.sort()
+        await Promise.all(selected.map(async (ck: string) => {
+          result[ck] = await this.queue.get(ck);
+        }));
+        return done(null, result);
+      }
 
-        const selected = chatKeys.slice(offset, offset + limit)
-        const result: Record<string, any> = {}
-        for (const ck of selected) {
-          result[ck] = await storageInstance.get(ck)
-        }
-        console.log("分页查询返回：", result)
-        return done(null, result)
-      }
-      // ============== 常规读取 ==============
-      const dataStr = await storageInstance.get(key)
-      if (!dataStr) {
-        // 若 storage 中没此 key
-        return done(null, null)
-      }
-      console.log(`Gun-Vue-Sqlite-Adapter: get(key=${key}) => found data.`)
-      // JSON.parse
-      let data
-      try {
-        data = typeof dataStr === 'string' ? JSON.parse(dataStr) : dataStr
-      } catch (e) {
-        console.warn(`解析存储中 key=${key} 时出错:`, e)
-        data = dataStr
-      }
-      return done(null, data)
-
-    } catch (error) {
-      console.error("Gun-Vue-Sqlite-Adapter: get error =>", error)
-      return done(error)
+      const data = await this.queue.get(key);
+      return done(null, data);
+    } catch (err) {
+      log.error(`get error: key=${key}`, err);
+      return done(err);
     }
   },
 
-  // ------------------------------------------------------
-  // put(node, done):
-  //   - 把 Gun 传来的增量节点存入数据库
-  //   - 如果 node.__command 存在，则执行特殊指令
-  //   - 否则先读旧节点 => CRDT 合并 => 写回
-  // ------------------------------------------------------
   put: async function (node: any, done: (err: any, result?: any) => void) {
-    console.log("Gun-Vue-Sqlite-Adapter: put() called. node =", node)
+    log.debug('put called:', node);
 
-    if (typeof done !== 'function') {
-      console.warn("No callback in put() call. node=", node)
-      return
-    }
+    if (typeof done !== 'function') return;
 
     try {
-      const storageInstance = this.storage || await ensureStorage()
+      if (typeof node !== 'object' || node === null) throw new Error('Invalid node');
 
-      // ============== 特殊命令 ==============
       if (node && node.__command) {
         switch (node.__command) {
           case 'remove':
-            if (node.key) {
-              await storageInstance.remove(node.key)
-              console.log(`remove 命令成功，key=${node.key}`)
-              return done(null)
-            } else {
-              throw new Error("remove 命令必须提供 key")
-            }
+            if (!node.key) throw new Error('remove requires key');
+            await this.storage.remove(node.key);
+            await this.queue.clearCache();
+            return done(null);
 
           case 'clear':
-            await storageInstance.clear()
-            console.log("clear 命令成功, 已清空全部存储")
-            return done(null)
+            await this.storage.clear();
+            await this.queue.clearCache();
+            return done(null);
 
-          case 'keys': {
-            const keys = await storageInstance.keys()
-            console.log("keys 命令成功 =>", keys)
-            return done(null, keys)
-          }
+          case 'keys':
+            const keys = await this.storage.keys();
+            return done(null, keys);
 
-          case 'length': {
-            const len = await storageInstance.length()
-            console.log("length 命令成功 =>", len)
-            return done(null, len)
-          }
+          case 'length':
+            const len = await this.storage.length();
+            return done(null, len);
 
-          case 'forEach': {
-            let items: any[] = []
-            await storageInstance.forEach((value: any, key: any, index: any) => {
-              items.push({ key, value, index })
-            })
-            console.log("forEach 命令完成 =>", items)
-            return done(null, items)
-          }
+          case 'forEach':
+            const items: any[] = [];
+            await this.storage.forEach((value: any, key: any, index: any) => items.push({ key, value, index }));
+            return done(null, items);
 
-          case 'set': {
-            if (node.key !== undefined && node.value !== undefined) {
-              await storageInstance.set(node.key, node.value)
-              console.log("set 命令成功, key =", node.key)
-              return done(null)
-            } else {
-              throw new Error("set 命令必须提供 key 和 value")
-            }
-          }
+          case 'set':
+            if (node.key === undefined || node.value === undefined) throw new Error('set requires key and value');
+            await this.storage.set(node.key, node.value);
+            await this.queue.clearCache();
+            return done(null);
 
-          case 'paginate': {
-            // 示例分页
-            if (node.key === undefined) {
-              throw new Error("paginate 命令必须提供 key")
-            }
-            const allKeys = await storageInstance.keys()
-            const filteredKeys = allKeys.filter((k: any) => k.startsWith(node.key))
-            filteredKeys.sort()
-            const offset = node.offset || 0
-            const limit = node.limit || 10
-            const pageKeys = filteredKeys.slice(offset, offset + limit)
-
-            let pageData = []
-            for (const k of pageKeys) {
-              const dt = await storageInstance.get(k)
-              pageData.push({ key: k, data: dt })
-            }
-            console.log("paginate 命令 => ", pageData)
-            return done(null, pageData)
-          }
+          case 'paginate':
+            if (!node.key) throw new Error('paginate requires key');
+            const allKeys = await this.storage.keys();
+            const filteredKeys = allKeys.filter((k: string) => k.startsWith(node.key)).sort();
+            const offset = node.offset || 0;
+            const limit = node.limit || 10;
+            const pageKeys = filteredKeys.slice(offset, offset + limit);
+            const pageData = await Promise.all(pageKeys.map(async (k: string) => ({ key: k, data: await this.queue.get(k) })));
+            return done(null, pageData);
 
           default:
-            throw new Error("未知命令类型: " + node.__command)
+            throw new Error(`Unknown command: ${node.__command}`);
         }
       }
 
-      // ============== 常规存储 (CRDT 合并) ==============
-      // node._.# (或 node._.id) 就是此节点的 soul
-      const soul = (node._ && (node._['#'] || node._.id)) as string
-      if (!soul) {
-        throw new Error("put() 失败：node 缺少 _.# 或 _.id")
+      const souls = Object.keys(node).length > 1 ? Object.keys(node) : [node._?.['#'] || node._.id];
+      if (!souls[0]) throw new Error('Missing soul in node');
+
+      if (souls.length > 1) {
+        await this.queue.batchPut(node); // 使用批量写入
+      } else {
+        await this.queue.put(souls[0], node[souls[0]] || node);
       }
-
-      // 1) 读取已存在的数据
-      const oldDataStr = await storageInstance.get(soul)
-      let oldNode: any = null
-      if (oldDataStr) {
-        try {
-          oldNode = JSON.parse(oldDataStr)
-        } catch (e) {
-          console.warn("解析旧节点出错, 将用空替代 =>", e)
-        }
-      }
-
-      // 2) CRDT 合并
-      const merged = mergeCRDT(oldNode, node)
-
-      // 3) 写回
-      await storageInstance.set(soul, JSON.stringify(merged))
-      console.log(`成功存储节点 soul=${soul}`)
-
-      return done(null)
-
-    } catch (error) {
-      console.error("Gun-Vue-Sqlite-Adapter: put error =>", error)
-      return done(error)
+      return done(null);
+    } catch (err) {
+      log.error('put error:', err);
+      return done(err);
     }
   },
-
-})
+});
 
 // 注册到 Flint
-Flint.register(gunIonicAdapter)
-console.log("Gun-Vue-Sqlite-Adapter 注册完成！")
-
-export default gunIonicAdapter
+Flint.register(gunIonicAdapter);
+log.info('Gun-Vue-Sqlite-Adapter registered!');
+export default gunIonicAdapter;
