@@ -1,6 +1,8 @@
 # gun-vue-sqlite-ionic-storage-adapter
 
 
+The new version uses the cache priority policy to further improve performance.
+
 This is a storage adapter for gun.js, designed specifically for mobile devices built with Vue. It enhances the persistence capabilities of gun’s network storage in Vue. It supports iOS and Android.
 For web environments, please disable this adapter and enable IndexedDB instead, and on Windows/macOS, it is recommended to use the File System API.
 
@@ -118,6 +120,10 @@ A heartfelt thank you to all the open source contributors—no one can do everyt
 
 
 # 中文
+
+
+新版本使用缓存优先策略，进一步提升性能
+
 
 这是一个gunjs的储存适配器。
 为使用VUE制作的移动设备针对性设计。增强vue中的gun网络储存持久化的能力。
