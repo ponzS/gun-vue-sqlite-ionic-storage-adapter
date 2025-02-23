@@ -1,8 +1,6 @@
 # gun-vue-sqlite-ionic-storage-adapter
 
 
-The new version uses the cache priority policy to further improve performance.
-
 This is a storage adapter for gun.js, designed specifically for mobile devices built with Vue. It enhances the persistence capabilities of gun’s network storage in Vue. It supports iOS and Android.
 For web environments, please disable this adapter and enable IndexedDB instead, and on Windows/macOS, it is recommended to use the File System API.
 
@@ -109,6 +107,18 @@ If you disable gun’s default storage entirely, data will be written only to me
 
 You will need to design your own synchronization logic and cleanup mechanism between gun and sqlite based on your requirements. For example, you might add an internal method to save data to sqlite when sending data, or modify the adapter to implement selective automatic synchronization. Due to the relatively simple concept but significant amount of code required, a full example is not provided here. Feel free to experiment with these suggestions if you have similar needs.
 
+
+# Update log
+
+Version 1.1
+
+Newly added
+
+1. Cache priority policy
+
+2. Cache management visualization components and interfaces
+
+
 # Final Thanks
 A heartfelt thank you to all the open source contributors—no one can do everything alone. Our collective efforts will create a better world.
 
@@ -120,9 +130,6 @@ A heartfelt thank you to all the open source contributors—no one can do everyt
 
 
 # 中文
-
-
-新版本使用缓存优先策略，进一步提升性能
 
 
 这是一个gunjs的储存适配器。
@@ -236,7 +243,21 @@ gun默认情况下会优先使用indexedDB，我们只使用gun同步数据而�
 例如在发送数据的接口中新增一个内置的保存到sqlite中的方法，或者是直接在适配器中改写你的自动选择性同步的
         因为这个方案过于简单但却又有比较多的代码量，所以本人不手写了，如果您有类似的需求可以尝试我的建议。
 
-  # 最后非常感谢开源贡献者们提供的帮助，一个人无法完成全部的工作，我们共同的付出会带来更美好的世界。
+
+# 更新日志
+version 1.1
+新增
+1.缓存优先策略
+2.缓存管理可视化组件与接口
+
+
+
+
+
+
+
+  # 最后
+  非常感谢开源贡献者们提供的帮助，一个人无法完成全部的工作，我们共同的付出会带来更美好的世界。
 
 
 
