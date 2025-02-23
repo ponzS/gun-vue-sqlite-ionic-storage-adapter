@@ -1,5 +1,6 @@
 # gun-vue-sqlite-ionic-storage-adapter
 
+<img width="650" alt="image" src="https://github.com/user-attachments/assets/cc61333e-192a-47ea-bea5-22ff03a21266" />
 
 This is a storage adapter for gun.js, designed specifically for mobile devices built with Vue. It enhances the persistence capabilities of gun’s network storage in Vue. It supports iOS and Android.
 For web environments, please disable this adapter and enable IndexedDB instead, and on Windows/macOS, it is recommended to use the File System API.
