@@ -1,13 +1,3 @@
-/* 
-  自定义适配器，使用 Gun-Flint + Ionic/Capacitor 的 SQLite (sharedStorage) 进行持久化。
-  本次升级关键点：
-  - 性能优化：批量操作、缓存热点数据、减少 JSON 开销。
-  - 处理GUN带来的数据海啸：请求队列、防抖机制。
-  - CRDT 合并：支持嵌套对象。
-  - SQLite 持久性：运行时缓存与 SQLite 深度整合，启动时恢复。
-  - 如需帮助，可在 X 上联系我。
-*/
-
 import { sharedStorage } from './sharedStorage';
 import { Flint, NodeAdapter } from 'gun-flint';
 
@@ -75,43 +65,29 @@ class RequestQueue {
   private debounceTimers: Map<string, NodeJS.Timeout> = new Map();
   private cache: Map<string, { data: any; timestamp: number }> = new Map();
   private storage: any;
-  private cacheTTL = 24 * 60 * 60 * 1000; // 缓存有效期：24小时
 
   constructor(storage: any) {
     this.storage = storage;
     this.initCache();
   }
 
-  // 初始化时从 SQLite 恢复缓存
   async initCache() {
     try {
       const cachedData = await this.storage.get('persistentCache');
       if (cachedData) {
         this.cache = new Map(JSON.parse(cachedData));
-        // 检查缓存有效性
-        const now = Date.now();
-        for (const [key, { timestamp }] of this.cache) {
-          if (now - timestamp > this.cacheTTL) {
-            this.cache.delete(key);
-          }
-        }
-        await this.storage.set('persistentCache', JSON.stringify([...this.cache]));
+        log.info('Cache restored from storage');
       }
     } catch (err) {
       log.error('Failed to initialize cache from storage:', err);
     }
   }
 
-  // 获取数据（优先缓存）
   async get(key: string): Promise<any> {
     if (this.cache.has(key)) {
-      const { data, timestamp } = this.cache.get(key)!;
-      if (Date.now() - timestamp < this.cacheTTL) {
-        log.debug(`Cache hit for key=${key}`);
-        return data;
-      } else {
-        this.cache.delete(key); // 过期则移除
-      }
+      const { data } = this.cache.get(key)!;
+      log.debug(`Cache hit for key=${key}`);
+      return data;
     }
 
     return new Promise((resolve, reject) => {
@@ -140,7 +116,6 @@ class RequestQueue {
     });
   }
 
-  // 写入数据（批量）
   async put(soul: string, node: any): Promise<void> {
     const oldData = await this.get(soul);
     const merged = mergeCRDT(oldData, node);
@@ -149,7 +124,6 @@ class RequestQueue {
     await this.storage.set('persistentCache', JSON.stringify([...this.cache]));
   }
 
-  // 批量写入
   async batchPut(nodes: Record<string, any>): Promise<void> {
     const updates: [string, string][] = [];
     for (const soul in nodes) {
@@ -158,29 +132,81 @@ class RequestQueue {
       updates.push([soul, JSON.stringify(merged)]);
       this.cache.set(soul, { data: merged, timestamp: Date.now() });
     }
-    // 批量写入
     await Promise.all(updates.map(([key, value]) => this.storage.set(key, value)));
     await this.storage.set('persistentCache', JSON.stringify([...this.cache]));
   }
 
-  // 清理缓存
-  async clearCache() {
-    this.cache.clear();
-    await this.storage.remove('persistentCache');
+  async clearCache(): Promise<void> {
+    try {
+      this.cache.clear();
+      await this.storage.remove('persistentCache');
+      log.info('Cache cleared manually');
+    } catch (err) {
+      log.error('Failed to clear cache:', err);
+      throw err;
+    }
+  }
+
+  // 估算缓存的内存占用（字节）
+  getCacheMemoryUsage(): number {
+    let totalBytes = 0;
+
+    for (const [key, value] of this.cache) {
+      // 键的字节数（UTF-16）
+      const keyBytes = key.length * 2 + 8;
+
+      // 值的字节数
+      const timestampBytes = 8;
+      const dataBytes = this.estimateObjectSize(value.data);
+
+      // Map 键值对开销（粗略估计）
+      const entryOverhead = 32;
+
+      totalBytes += keyBytes + timestampBytes + dataBytes + entryOverhead;
+    }
+
+    return totalBytes;
+  }
+
+  // 估算对象的字节数（递归计算）
+  private estimateObjectSize(obj: any): number {
+    if (obj === null || obj === undefined) return 0;
+
+    if (typeof obj === 'string') return obj.length * 2 + 8;
+    if (typeof obj === 'number') return 8;
+    if (typeof obj === 'boolean') return 8; // 对齐后通常占 8 字节
+
+    if (typeof obj === 'object') {
+      let size = 40; // 空对象的基础开销
+      for (const key in obj) {
+        if (Object.prototype.hasOwnProperty.call(obj, key)) {
+          size += key.length * 2 + 8; // 属性名
+          size += this.estimateObjectSize(obj[key]); // 属性值
+        }
+      }
+      return size;
+    }
+
+    return 0; // 其他类型忽略
+  }
+
+  getCacheStatus(): { size: number; memoryBytes: number } {
+    return {
+      size: this.cache.size,
+      memoryBytes: this.getCacheMemoryUsage(),
+    };
   }
 }
 
-/**
- * 适配器核心实现
- */
-const gunIonicAdapter = new NodeAdapter({
+// 定义适配器核心逻辑
+const adapterCore = {
+  storage: null as any,
+  queue: null as RequestQueue | null,
   opt: async function (context: any, options: any) {
-    log.info('Adapter initialized:', { context, options });
-    const storageInstance = await ensureStorage();
-    this.storage = storageInstance;
-    this.queue = new RequestQueue(storageInstance);
+    log.info('Adapter opt called:', { context, options });
+    this.storage = await ensureStorage();
+    this.queue = new RequestQueue(this.storage);
 
-    // 预加载热点数据（例如 buddyList）
     try {
       const buddyList = await this.queue.get('buddyList');
       if (buddyList) {
@@ -215,12 +241,12 @@ const gunIonicAdapter = new NodeAdapter({
         const result: Record<string, any> = {};
 
         await Promise.all(selected.map(async (ck: string) => {
-          result[ck] = await this.queue.get(ck);
+          result[ck] = await this.queue!.get(ck);
         }));
         return done(null, result);
       }
 
-      const data = await this.queue.get(key);
+      const data = await this.queue!.get(key);
       return done(null, data);
     } catch (err) {
       log.error(`get error: key=${key}`, err);
@@ -241,12 +267,12 @@ const gunIonicAdapter = new NodeAdapter({
           case 'remove':
             if (!node.key) throw new Error('remove requires key');
             await this.storage.remove(node.key);
-            await this.queue.clearCache();
+            log.info(`Key ${node.key} removed from storage`);
             return done(null);
 
           case 'clear':
             await this.storage.clear();
-            await this.queue.clearCache();
+            log.info('Storage cleared');
             return done(null);
 
           case 'keys':
@@ -265,7 +291,7 @@ const gunIonicAdapter = new NodeAdapter({
           case 'set':
             if (node.key === undefined || node.value === undefined) throw new Error('set requires key and value');
             await this.storage.set(node.key, node.value);
-            await this.queue.clearCache();
+            log.info(`Key ${node.key} set in storage`);
             return done(null);
 
           case 'paginate':
@@ -275,7 +301,7 @@ const gunIonicAdapter = new NodeAdapter({
             const offset = node.offset || 0;
             const limit = node.limit || 10;
             const pageKeys = filteredKeys.slice(offset, offset + limit);
-            const pageData = await Promise.all(pageKeys.map(async (k: string) => ({ key: k, data: await this.queue.get(k) })));
+            const pageData = await Promise.all(pageKeys.map(async (k: string) => ({ key: k, data: await this.queue!.get(k) })));
             return done(null, pageData);
 
           default:
@@ -287,9 +313,9 @@ const gunIonicAdapter = new NodeAdapter({
       if (!souls[0]) throw new Error('Missing soul in node');
 
       if (souls.length > 1) {
-        await this.queue.batchPut(node); // 使用批量写入
+        await this.queue!.batchPut(node);
       } else {
-        await this.queue.put(souls[0], node[souls[0]] || node);
+        await this.queue!.put(souls[0], node[souls[0]] || node);
       }
       return done(null);
     } catch (err) {
@@ -297,9 +323,28 @@ const gunIonicAdapter = new NodeAdapter({
       return done(err);
     }
   },
-});
+};
 
-// 注册到 Flint
-Flint.register(gunIonicAdapter);
-log.info('Gun-Vue-Sqlite-Adapter registered!');
+// 创建适配器实例并注册到 Flint
+const adapterInstance = new NodeAdapter(adapterCore);
+Flint.register(adapterInstance);
+
+// 初始化并导出适配器
+const gunIonicAdapter = {
+  clearCache: async () => {
+    if (!adapterCore.queue) throw new Error('Adapter not initialized');
+    await adapterCore.queue.clearCache();
+  },
+  getCacheStatus: () => {
+    if (!adapterCore.queue) throw new Error('Adapter not initialized');
+    return adapterCore.queue.getCacheStatus();
+  },
+};
+
+// 立即初始化
+(async () => {
+  await adapterCore.opt({}, {});
+  log.info('Gun-Vue-Sqlite-Adapter registered and initialized!');
+})();
+
 export default gunIonicAdapter;
